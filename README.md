@@ -2,7 +2,9 @@
 
 Rotátor pro anténní systémy s víceotáčkovým potenciometrem a TFT displejem.
 
-## 🚀 Rychlý start
+![Rotátor](rotator-ovladac.jpg)
+
+## Instalace a použití
 
 1. **Nainstaluj knihovny** v Arduino IDE:
    - Adafruit GFX Library
