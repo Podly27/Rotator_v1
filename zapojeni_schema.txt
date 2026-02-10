@@ -1,101 +1,124 @@
-# ZAPOJENÍ SCHÉMA - Arduino Rotátor
+# ZAPOJENÍ SCHÉMA - Arduino Rotátor (stabilizace analogové větve)
 
-## Přehled komponent:
+## Přehled komponent
 - Arduino UNO
-- TFT displej ST7789V (240x320)
-- Víceotáčkový potenciometr 10kΩ
-- 2x Relé moduly (5V)
+- TFT ST7789V (240x320)
+- Víceotáčkový potenciometr 5kΩ, 10 otáček (Bourns 3590S)
+- 2x relé modul 5V (aktivní LOW)
 - Piezo bzučák
-- Externí spínače pro motor (nezávislé na Arduinu)
+- Kabel YSLY-JZ 7x0,75 (cca 30 m, společně potenciometr + motor 230 V)
+- **MCP6001** (nebo MCP6002, použit 1 kanál) jako analogový buffer u rotátoru
 
-## ZAPOJENÍ PINŮ:
+---
 
-### Arduino UNO → TFT Displej ST7789V:
+## A) Strana rotátoru (u potenciometru) – buffer s MCP6001/MCP6002
+
+> Cíl: snížit vliv rušení na dlouhém vedení a odlehčit jezdci potenciometru.
+
+```
+Lokální 5V zdroj (u rotátoru)
+
+   +5V_local ------------------------------------+---------------------+
+                                                |                     |
+                                              [100nF]              [10uF] (vol.)
+                                                |                     |
+GND_local --------------------------------------+---------------------+
+                                                |
+                                           MCP6001 / MCP6002
+                                        +-----------------------+
+Pot 5k (3590S):                         | VDD               OUT |----[100R]-----> do kabelu (SIGNAL)
+  konec 1 -> +5V_local                 | +IN  <--- wiper ------|
+  wiper    -> +IN opamp                | -IN  <--- OUT --------|  (sledovač)
+  konec 3 -> GND_local                 | VSS               GND |
+                                        +-----------------------+
+
+Volitelná ochrana na signál:
+SIGNAL -> TVS/ESD -> GND_local  (co nejblíž vstupu/výstupu do kabelu)
+```
+
+### Důležité poznámky (rotátor)
+1. Potenciometr i opamp musí sdílet stejný **lokální** 5V/GND zdroj.
+2. Blokovací 100 nF dej fyzicky co nejblíž pinům VDD/VSS opampu.
+3. 100 Ω na výstupu opampu je doporučený pro stabilitu a tlumení špiček.
+4. 5 V pro potenciometr **neveď z Arduina** po 30 m kabelu.
+
+---
+
+## B) Strana Arduina (řídicí jednotka) – RC filtr u A0
+
+```
+ze 7žilového kabelu (SIGNAL) ----[220R]----+----> A0 (Arduino UNO)
+                                            |
+                                          [100nF]  (povinné, co nejblíž A0)
+                                            |
+                                           GND
+
+volitelně paralelně:
+A0 ----[1uF]---- GND  (silnější vyhlazení, pokud je šum stále vysoký)
+```
+
+### Zemnění / reference
+- Analogovou GND z kabelu přiveď na Arduino GND do **společného referenčního bodu** (hvězda).
+- Nenechávej proudy relé téct stejnou úzkou cestou jako analogovou referenci A0.
+
+---
+
+## Doporučené rozložení žil v kabelu YSLY-JZ 7x0,75
+
+- Motorové vodiče 230 V drž pohromadě (COM + směr1 + směr2).
+- Signál potenciometru (buffer OUT) veď co nejdál od motorových žil.
+- GND vodič dej vedle signálu (lepší návrat proudu/reference).
+- Pokud to kabel dovolí, nepoužité žíly uzemni jen na jedné straně jako stínění (volitelné).
+
+---
+
+## ZAPOJENÍ PINŮ ARDUINO
+
+### Arduino → TFT ST7789V
 ```
 Arduino Pin    TFT Pin    Popis
-----------    -------    -----
-5V            VCC        Napájení
-GND           GND        Zem
-Pin 10        CS         Chip Select
-Pin 8         DC         Data/Command
-Pin 9         RST        Reset
-Pin 11 (MOSI) SDA        Serial Data
-Pin 13 (SCK)  SCL        Serial Clock
+-----------    -------    -----
+5V             VCC        Napájení
+GND            GND        Zem
+Pin 10         CS         Chip Select
+Pin 8          DC         Data/Command
+Pin 9          RST        Reset
+Pin 11 (MOSI)  SDA        Serial Data
+Pin 13 (SCK)   SCL        Serial Clock
 ```
 
-### Arduino UNO → Potenciometr:
-```
-Arduino Pin    Potenciometr    Popis
-----------    -------------    -----
-5V            Pin 1           Napájení
-A0            Pin 2           Střední vývod (dělič)
-GND           Pin 3           Zem
-```
-
-### Arduino UNO → Relé moduly:
+### Arduino → Relé moduly (aktivní LOW)
 ```
 Arduino Pin    Relé Pin    Popis
-----------    ---------    -----
-Pin 2         IN1         Relé pro motor doleva
-Pin 3         IN2         Relé pro motor doprava
-5V            VCC         Napájení relé
-GND           GND         Zem relé
+-----------    ---------    -----
+Pin 2          IN1          Blokace směru doleva
+Pin 3          IN2          Blokace směru doprava
+5V             VCC          Napájení relé
+GND            GND          Zem relé
 ```
 
-### Arduino UNO → Piezo bzučák:
+### Arduino → Piezo
 ```
 Arduino Pin    Piezo    Popis
-----------    ------    -----
-Pin 7         +        Pozitivní vývod
-GND           -        Negativní vývod
-```
-## ZAPOJENÍ KABELU:
-```
-Konektor 7PIN:
-1 - potenciometr 1
-2 - potenciometr 2
-3 - potenciometr 3
-4 - motor společný
-5 - motor směr 1
-6 - motor směr 2
-7 - zem
+-----------    -----    -----
+Pin 7          +        Pozitivní vývod
+GND            -        Negativní vývod
 ```
 
-## EXTERNÍ ZAPOJENÍ MOTORU:
-```
-Spínač Doleva:
-- Spínač → Relé 1 (NO kontakty)
-- Relé 1 → Motor (fáze L1)
-- Motor → Spínač (fáze L2)
+---
 
-Spínač Doprava:
-- Spínač → Relé 2 (NO kontakty)
-- Relé 2 → Motor (fáze L1)
-- Motor → Spínač (fáze L2)
-```
+## Seznam součástek (pro stabilizaci)
+- MCP6001 (single) **nebo** MCP6002 (dual, využit 1 kanál)
+- 100 nF keramika (x2):
+  - 1x u opampu VDD-GND
+  - 1x u A0-GND
+- 10 µF (volitelně) u opamp napájení
+- 100 Ω (volitelně doporučeno) na výstupu opampu
+- 220 Ω sériově do A0
+- 1 µF (volitelně) paralelně na A0-GND
+- TVS/ESD dioda na signál proti GND (volitelně)
 
-## NAPÁJENÍ:
-- Arduino UNO: 7-12V přes DC jack nebo USB
-- TFT displej: 5V z Arduina
-- Relé moduly: 5V z Arduina
-- Potenciometr: 5V z Arduina
-- Piezo bzučák: 5V z Arduina
+---
 
-## BEZPEČNOSTNÍ POZNÁMKY:
-1. Relé moduly musí být aktivní LOW (HIGH = vypnuto)
-2. Motor je ovládán externími spínači, Arduino pouze vypíná relé při limitech
-3. Potenciometr je zapojen jako dělič napětí pro přesné měření
-4. Piezo bzučák varuje při dosažení bezpečnostních limitů
-
-## KALIBRACE:
-Po zapnutí se program automaticky načte pozici z potenciometru.
-Pro přesnou kalibraci:
-1. Nastav rotátor do střední pozice (360°)
-2. Otoč potenciometr do středu rozsahu
-3. Program si pozici zapamatuje
-
-## ROZSAHY:
-- Potenciometr: 0-1023 (ADC hodnota)
-- Úhel potenciometru: 0°-3600° (10 otáček)
-- Úhel rotátoru: 120°-480° (360° ± 120°)
-- Bezpečnostní limity: 270° a 450°
+## Bezpečnostní poznámka
+Vedení 230 V AC a 5 V signálů v jednom kabelu zvyšuje riziko rušení i bezpečnostních problémů. Návrh výše je kompromis pro stávající kabeláž; montáž a izolaci je nutné provést pečlivě podle platných norem a s vědomím rizik.

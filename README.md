@@ -36,7 +36,7 @@ Rotator/
 - **Převod**: 6:1 (96:16 zubů)
 - **Displej**: ST7789V 240x320 px
 - **Azimut**: 0-360° (střed 50% = 180°)
-- **Limity**: 0-10% a 90-100%
+- **Limity**: hystereze 9/12 % (dolní) a 91/88 % (horní) + FAIL-SAFE při chybě A0
 
 ## 📖 Dokumentace
 
@@ -54,3 +54,10 @@ Otevřený projekt pro radioamatérské použití.
 
 **Status:** ✅ Funkční verze  
 **Verze:** 1.0
+
+## Stabilizace signálu A0 (30 m kabel)
+
+- Buffer u potenciometru: MCP6001/MCP6002 jako sledovač.
+- RC filtr u Arduina: 220 Ω sériově do A0 + 100 nF na GND (volitelně 1 µF).
+- Firmware: oversampling + EMA filtr + hystereze limitů + FAIL-SAFE stav relé.
+- Podrobné zapojení viz `zapojeni_schema.txt`.

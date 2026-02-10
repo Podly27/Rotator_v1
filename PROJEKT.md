@@ -98,6 +98,27 @@ GND            -         Negativní vývod
 - Arduino pouze vypíná relé při bezpečnostních limitech
 - V bezpečné zóně jsou relé vypnutá (HIGH)
 
+
+## Stabilizace analogového měření po 30 m kabelu
+
+Pro spolehlivé čtení víceotáčkového potenciometru v přítomnosti vodičů 230 V je doporučeno kombinovat HW i SW filtraci:
+
+- **Buffer u potenciometru (MCP6001/MCP6002 jako sledovač)**: vysoká vstupní impedance nezatěžuje jezdec potenciometru a nízká výstupní impedance lépe budí dlouhé vedení.
+- **RC filtr u Arduina (220 Ω + 100 nF na A0, volitelně +1 µF)**: tlumí VF rušení a krátké špičky.
+- **Software filtrace + hystereze limitů**: oversampling/průměr, EMA low-pass a limity s odděleným ON/OFF prahem zabrání „cvakání“ relé.
+
+### Fyzické umístění součástek
+- 100 nF u opampu dej co nejblíž pinům VDD/VSS.
+- 220 Ω + 100 nF umísti co nejblíž pinu A0 na Arduino desce.
+- Analogový signál a GND veď mimo svazek relé a mimo svorky 230 V.
+
+### Doporučení k rozložení žil v 7žilovém kabelu
+- Motorové žíly (COM + 2 směry) drž pohromadě.
+- Analogový signál potenciometru veď co nejdál od motorových žil.
+- Referenční GND dej vedle analogového signálu.
+
+> Poznámka: vedení 230 V a 5 V v jednom kabelu je kompromisní řešení; dbej na izolaci, bezpečné oddělení obvodů a platné normy.
+
 ## Instalace
 
 ### Potřebné knihovny (Arduino IDE)
