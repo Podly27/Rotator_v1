@@ -2,9 +2,8 @@
  * Arduino Rotátor s víceotáčkovým potenciometrem
  * Převodový poměr: 96:16 (6:1)
  * TFT displej: ST7789V 240x320
- * 
- * Autor: AI Assistant
- * Verze: 1.0
+ *
+ * Verze: 1.1 - stabilizované čtení A0 (buffer + RC + SW filtrace + hystereze limitů)
  */
 
 #include <Adafruit_GFX.h>
@@ -18,172 +17,300 @@
 #define POT_PIN   A0
 #define RELAY_LEFT_PIN  2
 #define RELAY_RIGHT_PIN 3
+#define BUZZER_PIN 7
 
 // Konstanty pro potenciometr
-#define POT_MAX_VALUE    1023    // Maximální hodnota ADC (10-bit)
-#define POT_MAX_TURNS    10      // Počet otáček potenciometru
-#define POT_DEGREES_PER_TURN 360 // Stupně na otáčku
+constexpr int POT_MAX_VALUE = 1023;     // Maximální hodnota ADC (10-bit)
+constexpr int POT_MAX_TURNS = 10;       // Počet otáček potenciometru
+constexpr int POT_DEGREES_PER_TURN = 360;
 
-// Konstanty pro převod
-#define GEAR_RATIO       6       // Převodový poměr (96:16)
-#define ROTATOR_MAX_DEG  600     // Maximální rozsah rotátoru (360° ± 120°)
-#define ROTATOR_CENTER   360     // Střední pozice rotátoru
+// Konstanty pro převod (zachováno dle původního projektu)
+constexpr float GEAR_RATIO = 6.0f;      // Převodový poměr (96:16)
 
-// Bezpečnostní limity
-#define SAFETY_LIMIT_HIGH  450   // Horní bezpečnostní limit (360° + 90°)
-#define SAFETY_LIMIT_LOW   270   // Dolní bezpečnostní limit (360° - 90°)
+// Limity v procentech s hysterezí (snadno laditelné)
+constexpr float LOW_LIMIT_ON_PERCENT = 9.0f;
+constexpr float LOW_LIMIT_OFF_PERCENT = 12.0f;
+constexpr float HIGH_LIMIT_ON_PERCENT = 91.0f;
+constexpr float HIGH_LIMIT_OFF_PERCENT = 88.0f;
+
+// Filtrace analogového vstupu
+constexpr uint8_t ANALOG_SAMPLES = 32;          // Oversampling 32 vzorků
+constexpr uint16_t SAMPLE_DELAY_US = 250;       // Pauza mezi vzorky
+constexpr float EMA_ALPHA = 0.15f;              // IIR low-pass (EMA)
+
+// Detekce poruchy signálu
+constexpr int ADC_EXTREME_LOW = 2;              // Podezřelá hodnota blízko 0
+constexpr int ADC_EXTREME_HIGH = 1021;          // Podezřelá hodnota blízko 1023
+constexpr uint8_t ADC_EXTREME_COUNT_TRIP = 20;  // Kolik cyklů v extrému spustí ERROR
+
+// Časování
+constexpr uint16_t LOOP_PERIOD_MS = 50;         // UI ~20 Hz
+constexpr uint16_t LIMIT_BUZZER_DEBOUNCE_MS = 200;
+constexpr uint16_t LIMIT_BUZZER_REPEAT_MS = 1500;
 
 // Inicializace TFT displeje
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // Globální proměnné
-float currentRotatorAngle = 0;
-float currentPotRatio = 0;
-bool safetyLimitReached = false;
-int lastPotValue = 0;
+float currentRotatorAngle = 0.0f;
+float currentPotRatio = 0.0f;
+float currentPotPercent = 0.0f;
 
-// Proměnné pro optimalizaci vykreslování (zapamatování předchozí pozice)
-float lastDrawnAngle = -1;
+int rawAdcValue = 0;
+float filteredAdcValue = 0.0f;
+bool emaInitialized = false;
+
+bool lowLimitActive = false;
+bool highLimitActive = false;
+bool errorState = false;
+bool safetyLimitReached = false;
+
+uint8_t extremeCounter = 0;
+unsigned long limitStateSinceMs = 0;
+unsigned long lastLimitBeepMs = 0;
+
+// Proměnné pro optimalizaci vykreslování
+float lastDrawnAngle = -1.0f;
 int lastX1 = 0, lastY1 = 0, lastX2 = 0, lastY2 = 0, lastX3 = 0, lastY3 = 0;
 String lastAngleStr = "";
+String lastPercentStr = "";
+String lastFilterInfoStr = "";
+String lastStatusStr = "";
+
+unsigned long lastLoopMs = 0;
+
+float readAnalogFiltered();
+void updatePositionFromAdc(float adcFiltered);
+void updateSafetyState();
+void applyRelayInterlock(bool blockLeft, bool blockRight);
+void updateBuzzer();
+void drawCompass();
+void updateDisplay();
+void loadInitialPosition();
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Rotátor - inicializace...");
-  
-  // Inicializace pinů
+
+  // Bezpečný stav relé MUSÍ být nastaven okamžitě po bootu
   pinMode(RELAY_LEFT_PIN, OUTPUT);
   pinMode(RELAY_RIGHT_PIN, OUTPUT);
-  digitalWrite(RELAY_LEFT_PIN, HIGH);   // Relé vypnuto (HIGH = vypnuto pro aktivní LOW relé)
-  digitalWrite(RELAY_RIGHT_PIN, HIGH);
-  
+  pinMode(BUZZER_PIN, OUTPUT);
+  applyRelayInterlock(true, true);  // FAIL-SAFE: blokace obou směrů
+
+  pinMode(POT_PIN, INPUT);
+
+  Serial.println("Rotátor - inicializace...");
+
   // Inicializace TFT displeje
   tft.init(240, 320);
-  tft.setRotation(3); // Otočeno o 180°
+  tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
-  
-  // Načtení počáteční pozice
-  loadInitialPosition();
-  
-  // Úvodní obrazovka
+
   drawCompass();
-  
+  loadInitialPosition();
+
   // Vynutit překreslení při prvním zobrazení
-  lastAngleStr = "XXX";
-  
+  lastAngleStr = "INIT";
+  lastPercentStr = "INIT";
+  lastFilterInfoStr = "INIT";
+  lastStatusStr = "INIT";
   updateDisplay();
-  
+
   Serial.println("Rotátor připraven!");
 }
 
 void loop() {
-  // Čtení hodnoty potenciometru
-  int potValue = analogRead(POT_PIN);
-  
-  // Kontrola změny pozice
-  if (abs(potValue - lastPotValue) > 2) { // Hystereze pro stabilitu
-    updatePosition(potValue);
-    checkSafetyLimits();
-    updateDisplay();
-    lastPotValue = potValue;
-    
-    // Debug výstup
-    Serial.print("Pot: ");
-    Serial.print(potValue);
-    Serial.print(" | Rotátor: ");
-    Serial.print(currentRotatorAngle, 1);
-    Serial.print("° | Poměr: ");
-    Serial.print(currentPotRatio, 2);
-    Serial.println();
+  unsigned long now = millis();
+  if (now - lastLoopMs < LOOP_PERIOD_MS) {
+    return;
   }
-  
-  delay(50); // Krátká pauza pro stabilitu
+  lastLoopMs = now;
+
+  rawAdcValue = analogRead(POT_PIN);
+  filteredAdcValue = readAnalogFiltered();
+
+  // Detekce poruchy signálu (odpojený kabel, tvrdý zkrat, saturace)
+  bool extreme = (rawAdcValue <= ADC_EXTREME_LOW || rawAdcValue >= ADC_EXTREME_HIGH);
+  if (extreme) {
+    if (extremeCounter < 255) {
+      extremeCounter++;
+    }
+  } else {
+    extremeCounter = 0;
+  }
+
+  bool invalidValue = (!isfinite(filteredAdcValue) || filteredAdcValue < 0.0f || filteredAdcValue > POT_MAX_VALUE);
+  errorState = invalidValue || (extremeCounter >= ADC_EXTREME_COUNT_TRIP);
+
+  if (!errorState) {
+    updatePositionFromAdc(filteredAdcValue);
+  }
+
+  updateSafetyState();
+  updateBuzzer();
+  updateDisplay();
+
+  // Debug výstup
+  Serial.print("RAW: ");
+  Serial.print(rawAdcValue);
+  Serial.print(" | FIL: ");
+  Serial.print(filteredAdcValue, 1);
+  Serial.print(" | %: ");
+  Serial.print(currentPotPercent, 2);
+  Serial.print(" | AZ: ");
+  Serial.print(currentRotatorAngle, 1);
+  Serial.print(" | L/H/E: ");
+  Serial.print(lowLimitActive);
+  Serial.print("/");
+  Serial.print(highLimitActive);
+  Serial.print("/");
+  Serial.println(errorState);
 }
 
 void loadInitialPosition() {
-  int potValue = analogRead(POT_PIN);
-  updatePosition(potValue);
-  lastPotValue = potValue;
-  
+  rawAdcValue = analogRead(POT_PIN);
+  filteredAdcValue = readAnalogFiltered();
+
+  if (isfinite(filteredAdcValue) && filteredAdcValue >= 0.0f && filteredAdcValue <= POT_MAX_VALUE) {
+    updatePositionFromAdc(filteredAdcValue);
+    errorState = false;
+  } else {
+    errorState = true;
+    currentPotRatio = 0.0f;
+    currentPotPercent = 0.0f;
+    currentRotatorAngle = 0.0f;
+  }
+
+  updateSafetyState();
+
   Serial.print("Počáteční pozice načtena: ");
   Serial.print(currentRotatorAngle, 1);
   Serial.println("°");
 }
 
-void updatePosition(int potValue) {
-  // Výpočet poměru natočení potenciometru (0.0 - 1.0)
-  currentPotRatio = (float)potValue / POT_MAX_VALUE;
-  
-  // Výpočet úhlu potenciometru (0° - 3600°)
-  float potAngle = currentPotRatio * POT_MAX_TURNS * POT_DEGREES_PER_TURN;
-  
-  // Střed potenciometru (50% = 5 otáček = 1800°) odpovídá 180° azimutu (jih)
-  float potAngleFromCenter = potAngle - 1800.0; // -1800° až +1800°
-  
-  // Výpočet azimutu: každá otáčka potenciometru = 60° azimutu
-  // potAngleFromCenter / 6 = azimut od středu (180°)
-  currentRotatorAngle = (potAngleFromCenter / GEAR_RATIO) + 180.0;
-  
-  // Normalizace azimutu na rozsah 0° - 360°
-  while (currentRotatorAngle < 0) currentRotatorAngle += 360;
-  while (currentRotatorAngle >= 360) currentRotatorAngle -= 360;
+float readAnalogFiltered() {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < ANALOG_SAMPLES; i++) {
+    sum += analogRead(POT_PIN);
+    delayMicroseconds(SAMPLE_DELAY_US);
+  }
+
+  float avg = static_cast<float>(sum) / ANALOG_SAMPLES;
+
+  if (!emaInitialized || !isfinite(filteredAdcValue)) {
+    filteredAdcValue = avg;
+    emaInitialized = true;
+  } else {
+    filteredAdcValue = filteredAdcValue * (1.0f - EMA_ALPHA) + avg * EMA_ALPHA;
+  }
+
+  return filteredAdcValue;
 }
 
-void checkSafetyLimits() {
-  bool wasLimitReached = safetyLimitReached;
-  safetyLimitReached = false;
-  
-  // Kontrola podle procent potenciometru (0-10% a 90-100%)
-  float potPercent = currentPotRatio * 100;
-  
-  if (potPercent >= 90) {
-    safetyLimitReached = true;
-    digitalWrite(RELAY_RIGHT_PIN, LOW); // Vypnutí motoru doprava
-    Serial.println("BEZPEČNOSTNÍ LIMIT - Horní limit (90-100%)!");
-  } else if (potPercent <= 10) {
-    safetyLimitReached = true;
-    digitalWrite(RELAY_LEFT_PIN, LOW); // Vypnutí motoru doleva
-    Serial.println("BEZPEČNOSTNÍ LIMIT - Dolní limit (0-10%)!");
+void updatePositionFromAdc(float adcFiltered) {
+  currentPotRatio = adcFiltered / static_cast<float>(POT_MAX_VALUE);
+  if (currentPotRatio < 0.0f) currentPotRatio = 0.0f;
+  if (currentPotRatio > 1.0f) currentPotRatio = 1.0f;
+
+  currentPotPercent = currentPotRatio * 100.0f;
+
+  // Výpočet úhlu potenciometru (0° - 3600°)
+  float potAngle = currentPotRatio * POT_MAX_TURNS * POT_DEGREES_PER_TURN;
+
+  // Střed potenciometru (50% = 5 otáček = 1800°) odpovídá 180° azimutu
+  float potAngleFromCenter = potAngle - 1800.0f;
+  currentRotatorAngle = (potAngleFromCenter / GEAR_RATIO) + 180.0f;
+
+  // Normalizace azimutu na 0° - 360°
+  while (currentRotatorAngle < 0.0f) currentRotatorAngle += 360.0f;
+  while (currentRotatorAngle >= 360.0f) currentRotatorAngle -= 360.0f;
+}
+
+void updateSafetyState() {
+  bool previousAnyLimit = safetyLimitReached || errorState;
+
+  if (!errorState) {
+    // Hystereze dolního limitu
+    if (!lowLimitActive && currentPotPercent <= LOW_LIMIT_ON_PERCENT) {
+      lowLimitActive = true;
+    } else if (lowLimitActive && currentPotPercent >= LOW_LIMIT_OFF_PERCENT) {
+      lowLimitActive = false;
+    }
+
+    // Hystereze horního limitu
+    if (!highLimitActive && currentPotPercent >= HIGH_LIMIT_ON_PERCENT) {
+      highLimitActive = true;
+    } else if (highLimitActive && currentPotPercent <= HIGH_LIMIT_OFF_PERCENT) {
+      highLimitActive = false;
+    }
   } else {
-    // Vypnutí všech relé když jsme v bezpečném rozsahu
-    digitalWrite(RELAY_LEFT_PIN, HIGH);
-    digitalWrite(RELAY_RIGHT_PIN, HIGH);
+    // Při chybě zakázat obě směry
+    lowLimitActive = true;
+    highLimitActive = true;
   }
-  
-  if (safetyLimitReached && !wasLimitReached) {
-    // První dosažení limitu - zvukový signál
-    tone(7, 1000, 500); // Piezo na pinu 7
+
+  safetyLimitReached = lowLimitActive || highLimitActive;
+
+  // U relé logiky zachováme původní architekturu:
+  // LOW = aktivace blokace daného směru, HIGH = směr povolen
+  applyRelayInterlock(lowLimitActive, highLimitActive);
+
+  bool currentAnyLimit = safetyLimitReached || errorState;
+  if (currentAnyLimit && !previousAnyLimit) {
+    limitStateSinceMs = millis();
+  }
+}
+
+void applyRelayInterlock(bool blockLeft, bool blockRight) {
+  digitalWrite(RELAY_LEFT_PIN, blockLeft ? LOW : HIGH);
+  digitalWrite(RELAY_RIGHT_PIN, blockRight ? LOW : HIGH);
+}
+
+void updateBuzzer() {
+  unsigned long now = millis();
+
+  if (errorState) {
+    // Chyba = odlišné upozornění (2 krátké tóny), max 1x za 2 s
+    if (now - lastLimitBeepMs > 2000) {
+      tone(BUZZER_PIN, 1500, 120);
+      delay(140);
+      tone(BUZZER_PIN, 1100, 180);
+      lastLimitBeepMs = now;
+    }
+    return;
+  }
+
+  if (safetyLimitReached) {
+    // Debounce proti rychlému překmitu: limit musí trvat alespoň LIMIT_BUZZER_DEBOUNCE_MS
+    if ((now - limitStateSinceMs) >= LIMIT_BUZZER_DEBOUNCE_MS &&
+        (now - lastLimitBeepMs) >= LIMIT_BUZZER_REPEAT_MS) {
+      tone(BUZZER_PIN, 1000, 120);
+      lastLimitBeepMs = now;
+    }
   }
 }
 
 void drawCompass() {
   tft.fillScreen(ST77XX_BLACK);
-  
-  // Nakreslení růžice
+
   int centerX = tft.width() / 2;
   int centerY = tft.height() / 2;
-  int radius = min(centerX, centerY) - 27; // Větší kružnice o 3 body (bylo -30)
-  
-  // Jedna vnější kružnice
+  int radius = min(centerX, centerY) - 27;
+
   tft.drawCircle(centerX, centerY, radius, ST77XX_WHITE);
-  
-  // Označení světových stran uvnitř kružnice
+
   tft.setTextSize(2);
   tft.setTextColor(ST77XX_WHITE);
-  
-  // Sever (N) - nahoře
+
   tft.setCursor(centerX - 8, centerY - radius + 10);
   tft.print("N");
-  
-  // Východ (E) - vpravo
+
   tft.setCursor(centerX + radius - 25, centerY - 8);
   tft.print("E");
-  
-  // Jih (S) - dole
+
   tft.setCursor(centerX - 8, centerY + radius - 25);
   tft.print("S");
-  
-  // Západ (W) - vlevo
+
   tft.setCursor(centerX - radius + 10, centerY - 8);
   tft.print("W");
 }
@@ -191,103 +318,114 @@ void drawCompass() {
 void updateDisplay() {
   int centerX = tft.width() / 2;
   int centerY = tft.height() / 2;
-  int radius = min(centerX, centerY) - 27; // Stejný radius jako růžice
-  
-  // Vymazání staré šipky (černým trojúhelníkem)
+  int radius = min(centerX, centerY) - 27;
+
   if (lastDrawnAngle >= 0) {
     tft.fillTriangle(lastX1, lastY1, lastX2, lastY2, lastX3, lastY3, ST77XX_BLACK);
   }
-  
-  // Nová šipka - trojúhelník ZVENKU kružnice směřující ven (ostřejší)
-  float arrowAngle = radians(currentRotatorAngle - 90); // -90° pro správnou orientaci (0° = nahoru)
-  int arrowLength = 15; // Délka šipky od kruhu ven
-  int arrowOffset = 5; // Posun šipky dál od kruhu o 5 bodů
-  
-  // Špička trojúhelníku (daleko od kruhu)
+
+  float arrowAngle = radians(currentRotatorAngle - 90.0f);
+  int arrowLength = 15;
+  int arrowOffset = 5;
+
   int x1 = centerX + cos(arrowAngle) * (radius + arrowLength + arrowOffset);
   int y1 = centerY + sin(arrowAngle) * (radius + arrowLength + arrowOffset);
-  
-  // Levý roh základny (užší úhel = ostřejší trojúhelník)
-  float leftAngle = arrowAngle - 0.12; // bylo 0.2, nyní 0.12 = užší
+
+  float leftAngle = arrowAngle - 0.12f;
   int x2 = centerX + cos(leftAngle) * (radius + 2 + arrowOffset);
   int y2 = centerY + sin(leftAngle) * (radius + 2 + arrowOffset);
-  
-  // Pravý roh základny (užší úhel = ostřejší trojúhelník)
-  float rightAngle = arrowAngle + 0.12; // bylo 0.2, nyní 0.12 = užší
+
+  float rightAngle = arrowAngle + 0.12f;
   int x3 = centerX + cos(rightAngle) * (radius + 2 + arrowOffset);
   int y3 = centerY + sin(rightAngle) * (radius + 2 + arrowOffset);
-  
-  // Nakreslení červeného trojúhelníku
+
   tft.fillTriangle(x1, y1, x2, y2, x3, y3, ST77XX_RED);
-  
-  // Zapamatování pozice pro příští vymazání
+
   lastX1 = x1; lastY1 = y1;
   lastX2 = x2; lastY2 = y2;
   lastX3 = x3; lastY3 = y3;
   lastDrawnAngle = currentRotatorAngle;
-  
-  // Zobrazení úhlu rotátoru - velký standardní font
-  int angle = (int)currentRotatorAngle;
+
+  int angle = static_cast<int>(currentRotatorAngle);
   String angleStr = String(angle);
-  
-  // Pokud se číslo změnilo
+
   if (lastAngleStr != angleStr) {
-    // Přepsat staré číslo černou (pokud existuje a není "XXX")
-    if (lastAngleStr != "" && lastAngleStr != "XXX") {
+    if (lastAngleStr != "" && lastAngleStr != "INIT") {
       tft.setTextSize(6);
       tft.setTextColor(ST77XX_BLACK);
-      
-      // Vypočítat pozici starého textu
-      int oldTextWidth = lastAngleStr.length() * 36; // přibližná šířka pro font velikost 6
-      tft.setCursor(centerX - oldTextWidth/2, centerY - 24);
+      int oldTextWidth = lastAngleStr.length() * 36;
+      tft.setCursor(centerX - oldTextWidth / 2, centerY - 24);
       tft.print(lastAngleStr);
     }
-    
-    // Nastavit velký font (velikost 6 - maximum)
+
     tft.setTextSize(6);
     tft.setTextColor(ST77XX_YELLOW);
-    
-    // Vypočítat šířku textu pro vystředění
-    int textWidth = angleStr.length() * 36; // přibližná šířka pro font velikost 6
-    
-    // Nakreslit žlutý text
-    tft.setCursor(centerX - textWidth/2, centerY - 24);
+    int textWidth = angleStr.length() * 36;
+    tft.setCursor(centerX - textWidth / 2, centerY - 24);
     tft.print(angleStr);
-    
-    // Zapamatovat poslední zobrazený text
+
     lastAngleStr = angleStr;
   }
-  
-  // Zobrazení poměru potenciometru - levý dolní roh (jen procenta)
-  tft.fillRect(0, tft.height() - 25, 80, 25, ST77XX_BLACK); // Vymazání levého dolního rohu
-  tft.setTextSize(2);
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setCursor(10, tft.height() - 20);
-  tft.print((int)(currentPotRatio * 100));
-  tft.print("%");
-  
-  // Zobrazení bezpečnostního stavu - pravý dolní roh
-  if (safetyLimitReached) {
+
+  // Spodní levá část: FIL procenta + RAW/FIL informace
+  String percentStr = String(static_cast<int>(currentPotPercent)) + "%";
+  String filterInfo = "RAW:" + String(rawAdcValue) + " FIL:" + String(static_cast<int>(filteredAdcValue));
+
+  if (percentStr != lastPercentStr) {
+    tft.fillRect(0, tft.height() - 45, 90, 22, ST77XX_BLACK);
     tft.setTextSize(2);
-    tft.setTextColor(ST77XX_RED);
-    tft.setCursor(tft.width() - 80, tft.height() - 20);
-    tft.print("LIMIT!");
-  } else {
-    tft.fillRect(tft.width() - 80, tft.height() - 25, 80, 25, ST77XX_BLACK);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.setCursor(8, tft.height() - 40);
+    tft.print(percentStr);
+    lastPercentStr = percentStr;
+  }
+
+  if (filterInfo != lastFilterInfoStr) {
+    tft.fillRect(0, tft.height() - 22, 170, 22, ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(2, tft.height() - 14);
+    tft.print(filterInfo);
+    lastFilterInfoStr = filterInfo;
+  }
+
+  // Pravý dolní roh: stav
+  String statusStr = "OK";
+  uint16_t statusColor = ST77XX_GREEN;
+
+  if (errorState) {
+    statusStr = "ERROR";
+    statusColor = ST77XX_MAGENTA;
+  } else if (highLimitActive || lowLimitActive) {
+    statusStr = "LIMIT";
+    statusColor = ST77XX_RED;
+  }
+
+  if (statusStr != lastStatusStr) {
+    tft.fillRect(tft.width() - 90, tft.height() - 30, 90, 30, ST77XX_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(statusColor);
+    tft.setCursor(tft.width() - 88, tft.height() - 22);
+    tft.print(statusStr);
+    lastStatusStr = statusStr;
   }
 }
 
-// Funkce pro manuální ovládání (volitelné)
 void emergencyStop() {
-  digitalWrite(RELAY_LEFT_PIN, HIGH);
-  digitalWrite(RELAY_RIGHT_PIN, HIGH);
+  applyRelayInterlock(true, true);
+  lowLimitActive = true;
+  highLimitActive = true;
   safetyLimitReached = true;
+  errorState = true;
   Serial.println("EMERGENCY STOP!");
 }
 
 void resetSafetyLimits() {
+  lowLimitActive = false;
+  highLimitActive = false;
   safetyLimitReached = false;
-  digitalWrite(RELAY_LEFT_PIN, HIGH);
-  digitalWrite(RELAY_RIGHT_PIN, HIGH);
+  errorState = false;
+  extremeCounter = 0;
+  applyRelayInterlock(false, false);
   Serial.println("Bezpečnostní limity resetovány");
 }
