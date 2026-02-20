@@ -1,54 +1,57 @@
 /*
- * Arduino Rotátor - verze 2.0 (UNO + NANO)
- * UNO (shack): TFT, relé, piezo, limity a FAIL-SAFE
- * NANO (u rotátoru): měření potenciometru a přenos po 1-wire UART (open-collector)
+ * Arduino Rotátor s víceotáčkovým potenciometrem
+ * Převodový poměr: 96:16 (6:1)
+ * TFT displej: ST7789V 240x320
+ *
+ * Verze: 1.1 - stabilizované čtení A0 (buffer + RC + SW filtrace + hystereze limitů)
  */
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
-#include <SoftwareSerial.h>
 
 // Definice pinů
 #define TFT_CS    10
-#define TFT_RST   A2
-#define TFT_DC    A1
+#define TFT_RST   9
+#define TFT_DC    8
+#define POT_PIN   A0
 #define RELAY_LEFT_PIN  2
 #define RELAY_RIGHT_PIN 3
 #define BUZZER_PIN 7
 
-#define RX_PIN 8
-#define TX_PIN 9
-
-constexpr long LINK_BAUD = 9600;
-constexpr uint16_t PACKET_TIMEOUT_MS = 1000;
-constexpr uint8_t RX_LINE_MAX = 32;
-
 // Konstanty pro potenciometr
-constexpr int POT_MAX_VALUE = 1023;
-constexpr int POT_MAX_TURNS = 10;
+constexpr int POT_MAX_VALUE = 1023;     // Maximální hodnota ADC (10-bit)
+constexpr int POT_MAX_TURNS = 10;       // Počet otáček potenciometru
 constexpr int POT_DEGREES_PER_TURN = 360;
 
-// Konstanty pro převod
-constexpr float GEAR_RATIO = 6.0f;
+// Konstanty pro převod (zachováno dle původního projektu)
+constexpr float GEAR_RATIO = 6.0f;      // Převodový poměr (96:16)
 
-// Limity v procentech s hysterezí
+// Limity v procentech s hysterezí (snadno laditelné)
 constexpr float LOW_LIMIT_ON_PERCENT = 9.0f;
 constexpr float LOW_LIMIT_OFF_PERCENT = 12.0f;
 constexpr float HIGH_LIMIT_ON_PERCENT = 91.0f;
 constexpr float HIGH_LIMIT_OFF_PERCENT = 88.0f;
 
-// Vyhlazení přijatého ADC z NANO
-constexpr float EMA_ALPHA = 0.20f;
+// Filtrace analogového vstupu
+constexpr uint8_t ANALOG_SAMPLES = 32;          // Oversampling 32 vzorků
+constexpr uint16_t SAMPLE_DELAY_US = 250;       // Pauza mezi vzorky
+constexpr float EMA_ALPHA = 0.15f;              // IIR low-pass (EMA)
+
+// Detekce poruchy signálu
+constexpr int ADC_EXTREME_LOW = 2;              // Podezřelá hodnota blízko 0
+constexpr int ADC_EXTREME_HIGH = 1021;          // Podezřelá hodnota blízko 1023
+constexpr uint8_t ADC_EXTREME_COUNT_TRIP = 20;  // Kolik cyklů v extrému spustí ERROR
 
 // Časování
-constexpr uint16_t LOOP_PERIOD_MS = 50;
+constexpr uint16_t LOOP_PERIOD_MS = 50;         // UI ~20 Hz
 constexpr uint16_t LIMIT_BUZZER_DEBOUNCE_MS = 200;
 constexpr uint16_t LIMIT_BUZZER_REPEAT_MS = 1500;
 
+// Inicializace TFT displeje
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
-SoftwareSerial linkSerial(RX_PIN, TX_PIN);
 
+// Globální proměnné
 float currentRotatorAngle = 0.0f;
 float currentPotRatio = 0.0f;
 float currentPotPercent = 0.0f;
@@ -59,21 +62,14 @@ bool emaInitialized = false;
 
 bool lowLimitActive = false;
 bool highLimitActive = false;
-bool errorState = true;
+bool errorState = false;
 bool safetyLimitReached = false;
 
-unsigned long lastValidPacketMs = 0;
+uint8_t extremeCounter = 0;
 unsigned long limitStateSinceMs = 0;
 unsigned long lastLimitBeepMs = 0;
-unsigned long lastLoopMs = 0;
 
-uint32_t packetOkCount = 0;
-uint32_t packetCrcErrorCount = 0;
-uint32_t packetFormatErrorCount = 0;
-
-char rxLine[RX_LINE_MAX];
-uint8_t rxPos = 0;
-
+// Proměnné pro optimalizaci vykreslování
 float lastDrawnAngle = -1.0f;
 int lastX1 = 0, lastY1 = 0, lastX2 = 0, lastY2 = 0, lastX3 = 0, lastY3 = 0;
 String lastAngleStr = "";
@@ -81,52 +77,70 @@ String lastPercentStr = "";
 String lastFilterInfoStr = "";
 String lastStatusStr = "";
 
-uint8_t computeCrc(const char *payload);
-bool parsePacketLine(const char *line, int &adcOut);
-void processIncomingPackets();
+unsigned long lastLoopMs = 0;
+
+float readAnalogFiltered();
 void updatePositionFromAdc(float adcFiltered);
 void updateSafetyState();
 void applyRelayInterlock(bool blockLeft, bool blockRight);
 void updateBuzzer();
 void drawCompass();
 void updateDisplay();
+void loadInitialPosition();
 
 void setup() {
   Serial.begin(9600);
-  linkSerial.begin(LINK_BAUD);
 
+  // Bezpečný stav relé MUSÍ být nastaven okamžitě po bootu
   pinMode(RELAY_LEFT_PIN, OUTPUT);
   pinMode(RELAY_RIGHT_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  applyRelayInterlock(true, true);
+  applyRelayInterlock(true, true);  // FAIL-SAFE: blokace obou směrů
 
-  Serial.println("Rotátor UNO v2 - inicializace...");
+  pinMode(POT_PIN, INPUT);
 
+  Serial.println("Rotátor - inicializace...");
+
+  // Inicializace TFT displeje
   tft.init(240, 320);
   tft.setRotation(3);
   tft.fillScreen(ST77XX_BLACK);
 
   drawCompass();
+  loadInitialPosition();
 
+  // Vynutit překreslení při prvním zobrazení
   lastAngleStr = "INIT";
   lastPercentStr = "INIT";
   lastFilterInfoStr = "INIT";
   lastStatusStr = "INIT";
   updateDisplay();
 
-  Serial.println("UNO čeká na data z NANO...");
+  Serial.println("Rotátor připraven!");
 }
 
 void loop() {
-  processIncomingPackets();
-
   unsigned long now = millis();
   if (now - lastLoopMs < LOOP_PERIOD_MS) {
     return;
   }
   lastLoopMs = now;
 
-  errorState = (lastValidPacketMs == 0) || ((now - lastValidPacketMs) > PACKET_TIMEOUT_MS);
+  rawAdcValue = analogRead(POT_PIN);
+  filteredAdcValue = readAnalogFiltered();
+
+  // Detekce poruchy signálu (odpojený kabel, tvrdý zkrat, saturace)
+  bool extreme = (rawAdcValue <= ADC_EXTREME_LOW || rawAdcValue >= ADC_EXTREME_HIGH);
+  if (extreme) {
+    if (extremeCounter < 255) {
+      extremeCounter++;
+    }
+  } else {
+    extremeCounter = 0;
+  }
+
+  bool invalidValue = (!isfinite(filteredAdcValue) || filteredAdcValue < 0.0f || filteredAdcValue > POT_MAX_VALUE);
+  errorState = invalidValue || (extremeCounter >= ADC_EXTREME_COUNT_TRIP);
 
   if (!errorState) {
     updatePositionFromAdc(filteredAdcValue);
@@ -136,121 +150,61 @@ void loop() {
   updateBuzzer();
   updateDisplay();
 
-  Serial.print("ADC RAW/FIL: ");
+  // Debug výstup
+  Serial.print("RAW: ");
   Serial.print(rawAdcValue);
-  Serial.print("/");
+  Serial.print(" | FIL: ");
   Serial.print(filteredAdcValue, 1);
   Serial.print(" | %: ");
   Serial.print(currentPotPercent, 2);
   Serial.print(" | AZ: ");
   Serial.print(currentRotatorAngle, 1);
-  Serial.print(" | PKT ok/crc/fmt: ");
-  Serial.print(packetOkCount);
+  Serial.print(" | L/H/E: ");
+  Serial.print(lowLimitActive);
   Serial.print("/");
-  Serial.print(packetCrcErrorCount);
+  Serial.print(highLimitActive);
   Serial.print("/");
-  Serial.print(packetFormatErrorCount);
-  Serial.print(" | E: ");
   Serial.println(errorState);
 }
 
-void processIncomingPackets() {
-  while (linkSerial.available() > 0) {
-    char c = static_cast<char>(linkSerial.read());
+void loadInitialPosition() {
+  rawAdcValue = analogRead(POT_PIN);
+  filteredAdcValue = readAnalogFiltered();
 
-    if (c == '\r') {
-      continue;
-    }
-
-    if (c == '\n') {
-      rxLine[rxPos] = '\0';
-      if (rxPos > 0) {
-        int adc = 0;
-        if (parsePacketLine(rxLine, adc)) {
-          rawAdcValue = adc;
-          if (!emaInitialized || !isfinite(filteredAdcValue)) {
-            filteredAdcValue = static_cast<float>(adc);
-            emaInitialized = true;
-          } else {
-            filteredAdcValue = filteredAdcValue * (1.0f - EMA_ALPHA) + adc * EMA_ALPHA;
-          }
-
-          lastValidPacketMs = millis();
-          packetOkCount++;
-        }
-      }
-      rxPos = 0;
-      continue;
-    }
-
-    if (rxPos < (RX_LINE_MAX - 1)) {
-      rxLine[rxPos++] = c;
-    } else {
-      // Přetečení řádku -> zahoď paket
-      rxPos = 0;
-      packetFormatErrorCount++;
-    }
+  if (isfinite(filteredAdcValue) && filteredAdcValue >= 0.0f && filteredAdcValue <= POT_MAX_VALUE) {
+    updatePositionFromAdc(filteredAdcValue);
+    errorState = false;
+  } else {
+    errorState = true;
+    currentPotRatio = 0.0f;
+    currentPotPercent = 0.0f;
+    currentRotatorAngle = 0.0f;
   }
+
+  updateSafetyState();
+
+  Serial.print("Počáteční pozice načtena: ");
+  Serial.print(currentRotatorAngle, 1);
+  Serial.println("°");
 }
 
-bool parsePacketLine(const char *line, int &adcOut) {
-  // Očekáváme: P,<adc>,<crc>
-  const char *firstComma = strchr(line, ',');
-  if (!firstComma || line[0] != 'P') {
-    packetFormatErrorCount++;
-    return false;
+float readAnalogFiltered() {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < ANALOG_SAMPLES; i++) {
+    sum += analogRead(POT_PIN);
+    delayMicroseconds(SAMPLE_DELAY_US);
   }
 
-  const char *secondComma = strchr(firstComma + 1, ',');
-  if (!secondComma) {
-    packetFormatErrorCount++;
-    return false;
+  float avg = static_cast<float>(sum) / ANALOG_SAMPLES;
+
+  if (!emaInitialized || !isfinite(filteredAdcValue)) {
+    filteredAdcValue = avg;
+    emaInitialized = true;
+  } else {
+    filteredAdcValue = filteredAdcValue * (1.0f - EMA_ALPHA) + avg * EMA_ALPHA;
   }
 
-  if (strchr(secondComma + 1, ',') != nullptr) {
-    packetFormatErrorCount++;
-    return false;
-  }
-
-  char adcBuf[8];
-  size_t adcLen = static_cast<size_t>(secondComma - (firstComma + 1));
-  if (adcLen == 0 || adcLen >= sizeof(adcBuf)) {
-    packetFormatErrorCount++;
-    return false;
-  }
-  memcpy(adcBuf, firstComma + 1, adcLen);
-  adcBuf[adcLen] = '\0';
-
-  int adc = atoi(adcBuf);
-  if (adc < 0 || adc > POT_MAX_VALUE) {
-    packetFormatErrorCount++;
-    return false;
-  }
-
-  int rxCrc = atoi(secondComma + 1);
-  if (rxCrc < 0 || rxCrc > 255) {
-    packetFormatErrorCount++;
-    return false;
-  }
-
-  char payload[16];
-  snprintf(payload, sizeof(payload), "P,%d", adc);
-  uint8_t crc = computeCrc(payload);
-  if (crc != static_cast<uint8_t>(rxCrc)) {
-    packetCrcErrorCount++;
-    return false;
-  }
-
-  adcOut = adc;
-  return true;
-}
-
-uint8_t computeCrc(const char *payload) {
-  uint8_t crc = 0;
-  while (*payload) {
-    crc ^= static_cast<uint8_t>(*payload++);
-  }
-  return crc;
+  return filteredAdcValue;
 }
 
 void updatePositionFromAdc(float adcFiltered) {
@@ -260,10 +214,14 @@ void updatePositionFromAdc(float adcFiltered) {
 
   currentPotPercent = currentPotRatio * 100.0f;
 
+  // Výpočet úhlu potenciometru (0° - 3600°)
   float potAngle = currentPotRatio * POT_MAX_TURNS * POT_DEGREES_PER_TURN;
+
+  // Střed potenciometru (50% = 5 otáček = 1800°) odpovídá 180° azimutu
   float potAngleFromCenter = potAngle - 1800.0f;
   currentRotatorAngle = (potAngleFromCenter / GEAR_RATIO) + 180.0f;
 
+  // Normalizace azimutu na 0° - 360°
   while (currentRotatorAngle < 0.0f) currentRotatorAngle += 360.0f;
   while (currentRotatorAngle >= 360.0f) currentRotatorAngle -= 360.0f;
 }
@@ -272,23 +230,29 @@ void updateSafetyState() {
   bool previousAnyLimit = safetyLimitReached || errorState;
 
   if (!errorState) {
+    // Hystereze dolního limitu
     if (!lowLimitActive && currentPotPercent <= LOW_LIMIT_ON_PERCENT) {
       lowLimitActive = true;
     } else if (lowLimitActive && currentPotPercent >= LOW_LIMIT_OFF_PERCENT) {
       lowLimitActive = false;
     }
 
+    // Hystereze horního limitu
     if (!highLimitActive && currentPotPercent >= HIGH_LIMIT_ON_PERCENT) {
       highLimitActive = true;
     } else if (highLimitActive && currentPotPercent <= HIGH_LIMIT_OFF_PERCENT) {
       highLimitActive = false;
     }
   } else {
+    // Při chybě zakázat obě směry
     lowLimitActive = true;
     highLimitActive = true;
   }
 
   safetyLimitReached = lowLimitActive || highLimitActive;
+
+  // U relé logiky zachováme původní architekturu:
+  // LOW = aktivace blokace daného směru, HIGH = směr povolen
   applyRelayInterlock(lowLimitActive, highLimitActive);
 
   bool currentAnyLimit = safetyLimitReached || errorState;
@@ -306,6 +270,7 @@ void updateBuzzer() {
   unsigned long now = millis();
 
   if (errorState) {
+    // Chyba = odlišné upozornění (2 krátké tóny), max 1x za 2 s
     if (now - lastLimitBeepMs > 2000) {
       tone(BUZZER_PIN, 1500, 120);
       delay(140);
@@ -316,6 +281,7 @@ void updateBuzzer() {
   }
 
   if (safetyLimitReached) {
+    // Debounce proti rychlému překmitu: limit musí trvat alespoň LIMIT_BUZZER_DEBOUNCE_MS
     if ((now - limitStateSinceMs) >= LIMIT_BUZZER_DEBOUNCE_MS &&
         (now - lastLimitBeepMs) >= LIMIT_BUZZER_REPEAT_MS) {
       tone(BUZZER_PIN, 1000, 120);
@@ -401,8 +367,9 @@ void updateDisplay() {
     lastAngleStr = angleStr;
   }
 
+  // Spodní levá část: FIL procenta + RAW/FIL informace
   String percentStr = String(static_cast<int>(currentPotPercent)) + "%";
-  String filterInfo = "RX:" + String(rawAdcValue) + " FIL:" + String(static_cast<int>(filteredAdcValue));
+  String filterInfo = "RAW:" + String(rawAdcValue) + " FIL:" + String(static_cast<int>(filteredAdcValue));
 
   if (percentStr != lastPercentStr) {
     tft.fillRect(0, tft.height() - 45, 90, 22, ST77XX_BLACK);
@@ -414,7 +381,7 @@ void updateDisplay() {
   }
 
   if (filterInfo != lastFilterInfoStr) {
-    tft.fillRect(0, tft.height() - 22, 190, 22, ST77XX_BLACK);
+    tft.fillRect(0, tft.height() - 22, 170, 22, ST77XX_BLACK);
     tft.setTextSize(1);
     tft.setTextColor(ST77XX_WHITE);
     tft.setCursor(2, tft.height() - 14);
@@ -422,6 +389,7 @@ void updateDisplay() {
     lastFilterInfoStr = filterInfo;
   }
 
+  // Pravý dolní roh: stav
   String statusStr = "OK";
   uint16_t statusColor = ST77XX_GREEN;
 
@@ -441,4 +409,23 @@ void updateDisplay() {
     tft.print(statusStr);
     lastStatusStr = statusStr;
   }
+}
+
+void emergencyStop() {
+  applyRelayInterlock(true, true);
+  lowLimitActive = true;
+  highLimitActive = true;
+  safetyLimitReached = true;
+  errorState = true;
+  Serial.println("EMERGENCY STOP!");
+}
+
+void resetSafetyLimits() {
+  lowLimitActive = false;
+  highLimitActive = false;
+  safetyLimitReached = false;
+  errorState = false;
+  extremeCounter = 0;
+  applyRelayInterlock(false, false);
+  Serial.println("Bezpečnostní limity resetovány");
 }

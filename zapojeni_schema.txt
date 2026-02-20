@@ -1,93 +1,84 @@
-# ZAPOJENÍ SCHÉMA - Arduino Rotátor (stabilizace analogové větve)
+# ZAPOJENÍ SCHÉMA - Arduino Rotátor verze 2.0 (UNO + NANO, 1-wire UART)
 
-## Přehled komponent
-- Arduino UNO
-- TFT ST7789V (240x320)
-- Víceotáčkový potenciometr 5kΩ, 10 otáček (Bourns 3590S)
-- 2x relé modul 5V (aktivní LOW)
-- Piezo bzučák
-- Kabel YSLY-JZ 7x0,75 (cca 30 m, společně potenciometr + motor 230 V)
-- **MCP6001** (nebo MCP6002, použit 1 kanál) jako analogový buffer u rotátoru
+## Proč verze 2.0
+Původní analogová větev (A0 přes ~30 m kabel) může být citlivá na rušení od motoru a 230 V.
+Verze 2.0 proto měří potenciometr lokálně na NANO a do UNO posílá pouze digitální data po 1 vodiči (open-collector).
+
+> Původní analogové schéma je zachováno v `legacy/zapojeni_schema_v1.txt`.
 
 ---
 
-## A) Strana rotátoru (u potenciometru) – buffer s MCP6001/MCP6002
+## A) Strana NANO (u rotátoru) – vysílač open-collector
 
-> Cíl: snížit vliv rušení na dlouhém vedení a odlehčit jezdci potenciometru.
-
+### Potenciometr
 ```
-Lokální 5V zdroj (u rotátoru)
-
-   +5V_local ------------------------------------+---------------------+
-                                                |                     |
-                                              [100nF]              [10uF] (vol.)
-                                                |                     |
-GND_local --------------------------------------+---------------------+
-                                                |
-                                           MCP6001 / MCP6002
-                                        +-----------------------+
-Pot 5k (3590S):                         | VDD               OUT |----[100R]-----> do kabelu (SIGNAL)
-  konec 1 -> +5V_local                 | +IN  <--- wiper ------|
-  wiper    -> +IN opamp                | -IN  <--- OUT --------|  (sledovač)
-  konec 3 -> GND_local                 | VSS               GND |
-                                        +-----------------------+
-
-Volitelná ochrana na signál:
-SIGNAL -> TVS/ESD -> GND_local  (co nejblíž vstupu/výstupu do kabelu)
+NANO Pin        Potenciometr    Popis
+--------        ------------    -----
+5V              Pin 1           Napájení
+A0              Pin 2           Jezdec
+GND             Pin 3           Zem
 ```
 
-### Důležité poznámky (rotátor)
-1. Potenciometr i opamp musí sdílet stejný **lokální** 5V/GND zdroj.
-2. Blokovací 100 nF dej fyzicky co nejblíž pinům VDD/VSS opampu.
-3. 100 Ω na výstupu opampu je doporučený pro stabilitu a tlumení špiček.
-4. 5 V pro potenciometr **neveď z Arduina** po 30 m kabelu.
+### DATA výstup přes NPN tranzistor
+```
+NANO D8 (TX) ----[1k]----B   NPN (2N2222 / BC337)
+                           C---- DATA vodič do kabelu
+GND -----------------------E
+```
+
+- Vysílač je open-collector (aktivně tahá DATA k zemi).
+- Pokud je třeba, lze použít i 2N7000, ale primárně je doporučen NPN dle schématu.
 
 ---
 
-## B) Strana Arduina (řídicí jednotka) – RC filtr u A0
+## B) Strana UNO (v shacku) – přijímač
 
+### DATA vstup + pull-up
 ```
-ze 7žilového kabelu (SIGNAL) ----[220R]----+----> A0 (Arduino UNO)
-                                            |
-                                          [100nF]  (povinné, co nejblíž A0)
-                                            |
-                                           GND
-
-volitelně paralelně:
-A0 ----[1uF]---- GND  (silnější vyhlazení, pokud je šum stále vysoký)
+DATA vodič ----[1k]---- UNO D8 (RX, SoftwareSerial)
+      |
+     [4k7]
+      |
+     +5V
 ```
 
-### Zemnění / reference
-- Analogovou GND z kabelu přiveď na Arduino GND do **společného referenčního bodu** (hvězda).
-- Nenechávej proudy relé téct stejnou úzkou cestou jako analogovou referenci A0.
+- Pull-up pouze na straně UNO.
+- TX pro UNO diagnostiku: D9 (volitelné, běžně nepoužité).
+- GND mezi UNO a NANO musí být společná.
 
 ---
 
-## Doporučené rozložení žil v kabelu YSLY-JZ 7x0,75
+## C) Napájení po 3 žilách
 
-- Motorové vodiče 230 V drž pohromadě (COM + směr1 + směr2).
-- Signál potenciometru (buffer OUT) veď co nejdál od motorových žil.
-- GND vodič dej vedle signálu (lepší návrat proudu/reference).
-- Pokud to kabel dovolí, nepoužité žíly uzemni jen na jedné straně jako stínění (volitelné).
+```
+Žíla 1: GND      -> společná zem UNO + NANO
+Žíla 2: +V       -> 5 až 12 V směrem k NANO (při >5 V použít step-down na 5 V)
+Žíla 3: DATA     -> 1-wire UART open-collector
+```
+
+Doporučení pro 30 m kabel:
+- Pull-up 4k7 je výchozí.
+- Pokud jsou hrany pomalé, zkus 2k2.
+- Vést DATA co nejdál od 230 V vodičů.
 
 ---
 
-## ZAPOJENÍ PINŮ ARDUINO
+## ZAPOJENÍ PINŮ ARDUINO UNO (v2)
 
-### Arduino → TFT ST7789V
+### UNO → TFT ST7789V
 ```
 Arduino Pin    TFT Pin    Popis
 -----------    -------    -----
 5V             VCC        Napájení
 GND            GND        Zem
 Pin 10         CS         Chip Select
-Pin 8          DC         Data/Command
-Pin 9          RST        Reset
+A1             DC         Data/Command
+A2             RST        Reset
 Pin 11 (MOSI)  SDA        Serial Data
 Pin 13 (SCK)   SCL        Serial Clock
 ```
 
-### Arduino → Relé moduly (aktivní LOW)
+### UNO → Relé moduly (aktivní LOW)
 ```
 Arduino Pin    Relé Pin    Popis
 -----------    ---------    -----
@@ -97,7 +88,7 @@ Pin 3          IN2          Blokace směru doprava
 GND            GND          Zem relé
 ```
 
-### Arduino → Piezo
+### UNO → Piezo
 ```
 Arduino Pin    Piezo    Popis
 -----------    -----    -----
@@ -107,18 +98,7 @@ GND            -        Negativní vývod
 
 ---
 
-## Seznam součástek (pro stabilizaci)
-- MCP6001 (single) **nebo** MCP6002 (dual, využit 1 kanál)
-- 100 nF keramika (x2):
-  - 1x u opampu VDD-GND
-  - 1x u A0-GND
-- 10 µF (volitelně) u opamp napájení
-- 100 Ω (volitelně doporučeno) na výstupu opampu
-- 220 Ω sériově do A0
-- 1 µF (volitelně) paralelně na A0-GND
-- TVS/ESD dioda na signál proti GND (volitelně)
-
----
-
-## Bezpečnostní poznámka
-Vedení 230 V AC a 5 V signálů v jednom kabelu zvyšuje riziko rušení i bezpečnostních problémů. Návrh výše je kompromis pro stávající kabeláž; montáž a izolaci je nutné provést pečlivě podle platných norem a s vědomím rizik.
+## Bezpečnost
+- Kombinace 230 V a nízkonapěťové signalizace v jednom kabelu je riziková.
+- Dodrž oddělení, izolaci a lokální normy.
+- Při ztrátě dat (timeout) UNO přechází do FAIL-SAFE: obě relé blokována, stav ERROR.

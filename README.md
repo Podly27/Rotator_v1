@@ -1,63 +1,49 @@
 # Arduino Rotátor
 
-Rotátor pro anténní systémy s víceotáčkovým potenciometrem a TFT displejem.
+Rotátor pro anténní systémy s víceotáčkovým potenciometrem, TFT displejem a bezpečnostní logikou relé.
 
 ![Rotátor](rotator-ovladac.jpg)
 
-## Instalace a použití
+## Verze 2.0 – dvouřídicí architektura UNO + NANO
 
-1. **Nainstaluj knihovny** v Arduino IDE:
-   - Adafruit GFX Library
-   - Adafruit ST7789 Library
+Nová verze řeší rušení na dlouhém analogovém vedení tím, že:
+- **NANO u rotátoru** čte potenciometr lokálně (A0), filtruje hodnotu a posílá ji digitálně.
+- **UNO v shacku** přijímá data po 1 vodiči (open-collector UART), řídí TFT, relé, limity a piezo.
 
-2. **Otevři a nahraj** program:
-   - Soubor: `rotator_main/rotator_main.ino`
-   - Board: Arduino UNO
-   - Nahraj do Arduina
+Komunikace: `P,<adc>,<crc>\n` při 9600 Bd.
 
-3. **Zapoj komponenty** podle schématu v `zapojeni_schema.txt`
+## Quick start (v2)
 
-4. **Kalibruj**: Nastav potenciometr na střed (50%) = 180° (jih)
+1. Nahraj `rotator_node_nano/rotator_node_nano.ino` do **Arduino NANO**.
+2. Nahraj `rotator_main/rotator_main.ino` do **Arduino UNO**.
+3. Propoj 3 žíly mezi UNO a NANO:
+   - GND
+   - +V (5–12 V, při >5 V přes step-down na 5 V pro NANO)
+   - DATA (open-collector dle `zapojeni_schema.txt`)
+4. Ověř, že UNO přijímá data (na TFT stav `OK`, při výpadku `ERROR`).
 
 ## 📁 Struktura projektu
 
 ```
 Rotator/
 ├── rotator_main/
-│   └── rotator_main.ino        # Hlavní program (POUŽIJ TENTO)
-├── zapojeni_schema.txt          # Zapojení pinů
-├── PROJEKT.md                   # Kompletní dokumentace
-└── README.md                    # Tento soubor
+│   └── rotator_main.ino            # UNO (shack) – hlavní program (verze 2)
+├── rotator_node_nano/
+│   └── rotator_node_nano.ino       # NANO (rotátor) – čtení potenciometru + TX
+├── legacy/
+│   ├── rotator_main_analog_v1.ino  # původní analogová verze (archiv)
+│   └── zapojeni_schema_v1.txt      # původní schéma analog A0 (archiv)
+├── zapojeni_schema.txt             # aktuální schéma (verze 2)
+├── PROJEKT.md
+└── README.md
 ```
 
-## ⚙️ Specifikace
+## Legacy / v1
 
-- **Potenciometr**: 5kΩ lineární, 10 otáček
-- **Převod**: 6:1 (96:16 zubů)
-- **Displej**: ST7789V 240x320 px
-- **Azimut**: 0-360° (střed 50% = 180°)
-- **Limity**: hystereze 9/12 % (dolní) a 91/88 % (horní) + FAIL-SAFE při chybě A0
+Původní analogová varianta (A0 po dlouhém kabelu + MCP6001/MCP6002 + RC filtr) byla zachována v adresáři `legacy/`.
 
-## 📖 Dokumentace
+## Dokumentace
 
-Viz **PROJEKT.md** pro kompletní dokumentaci projektu včetně:
-- Detailního zapojení
-- Kalibrace a nastavení
-- Řešení problémů
-- Možná rozšíření
-
-## 🛠️ Podpora
-
-Otevřený projekt pro radioamatérské použití.
-
----
-
-**Status:** ✅ Funkční verze  
-**Verze:** 1.0
-
-## Stabilizace signálu A0 (30 m kabel)
-
-- Buffer u potenciometru: MCP6001/MCP6002 jako sledovač.
-- RC filtr u Arduina: 220 Ω sériově do A0 + 100 nF na GND (volitelně 1 µF).
-- Firmware: oversampling + EMA filtr + hystereze limitů + FAIL-SAFE stav relé.
-- Podrobné zapojení viz `zapojeni_schema.txt`.
+- Kompletní popis projektu: `PROJEKT.md`
+- Aktuální zapojení v2: `zapojeni_schema.txt`
+- Archivní analogové zapojení: `legacy/zapojeni_schema_v1.txt`

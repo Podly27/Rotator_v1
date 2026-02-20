@@ -1,0 +1,124 @@
+# ZAPOJENÍ SCHÉMA - Arduino Rotátor (stabilizace analogové větve)
+
+## Přehled komponent
+- Arduino UNO
+- TFT ST7789V (240x320)
+- Víceotáčkový potenciometr 5kΩ, 10 otáček (Bourns 3590S)
+- 2x relé modul 5V (aktivní LOW)
+- Piezo bzučák
+- Kabel YSLY-JZ 7x0,75 (cca 30 m, společně potenciometr + motor 230 V)
+- **MCP6001** (nebo MCP6002, použit 1 kanál) jako analogový buffer u rotátoru
+
+---
+
+## A) Strana rotátoru (u potenciometru) – buffer s MCP6001/MCP6002
+
+> Cíl: snížit vliv rušení na dlouhém vedení a odlehčit jezdci potenciometru.
+
+```
+Lokální 5V zdroj (u rotátoru)
+
+   +5V_local ------------------------------------+---------------------+
+                                                |                     |
+                                              [100nF]              [10uF] (vol.)
+                                                |                     |
+GND_local --------------------------------------+---------------------+
+                                                |
+                                           MCP6001 / MCP6002
+                                        +-----------------------+
+Pot 5k (3590S):                         | VDD               OUT |----[100R]-----> do kabelu (SIGNAL)
+  konec 1 -> +5V_local                 | +IN  <--- wiper ------|
+  wiper    -> +IN opamp                | -IN  <--- OUT --------|  (sledovač)
+  konec 3 -> GND_local                 | VSS               GND |
+                                        +-----------------------+
+
+Volitelná ochrana na signál:
+SIGNAL -> TVS/ESD -> GND_local  (co nejblíž vstupu/výstupu do kabelu)
+```
+
+### Důležité poznámky (rotátor)
+1. Potenciometr i opamp musí sdílet stejný **lokální** 5V/GND zdroj.
+2. Blokovací 100 nF dej fyzicky co nejblíž pinům VDD/VSS opampu.
+3. 100 Ω na výstupu opampu je doporučený pro stabilitu a tlumení špiček.
+4. 5 V pro potenciometr **neveď z Arduina** po 30 m kabelu.
+
+---
+
+## B) Strana Arduina (řídicí jednotka) – RC filtr u A0
+
+```
+ze 7žilového kabelu (SIGNAL) ----[220R]----+----> A0 (Arduino UNO)
+                                            |
+                                          [100nF]  (povinné, co nejblíž A0)
+                                            |
+                                           GND
+
+volitelně paralelně:
+A0 ----[1uF]---- GND  (silnější vyhlazení, pokud je šum stále vysoký)
+```
+
+### Zemnění / reference
+- Analogovou GND z kabelu přiveď na Arduino GND do **společného referenčního bodu** (hvězda).
+- Nenechávej proudy relé téct stejnou úzkou cestou jako analogovou referenci A0.
+
+---
+
+## Doporučené rozložení žil v kabelu YSLY-JZ 7x0,75
+
+- Motorové vodiče 230 V drž pohromadě (COM + směr1 + směr2).
+- Signál potenciometru (buffer OUT) veď co nejdál od motorových žil.
+- GND vodič dej vedle signálu (lepší návrat proudu/reference).
+- Pokud to kabel dovolí, nepoužité žíly uzemni jen na jedné straně jako stínění (volitelné).
+
+---
+
+## ZAPOJENÍ PINŮ ARDUINO
+
+### Arduino → TFT ST7789V
+```
+Arduino Pin    TFT Pin    Popis
+-----------    -------    -----
+5V             VCC        Napájení
+GND            GND        Zem
+Pin 10         CS         Chip Select
+Pin 8          DC         Data/Command
+Pin 9          RST        Reset
+Pin 11 (MOSI)  SDA        Serial Data
+Pin 13 (SCK)   SCL        Serial Clock
+```
+
+### Arduino → Relé moduly (aktivní LOW)
+```
+Arduino Pin    Relé Pin    Popis
+-----------    ---------    -----
+Pin 2          IN1          Blokace směru doleva
+Pin 3          IN2          Blokace směru doprava
+5V             VCC          Napájení relé
+GND            GND          Zem relé
+```
+
+### Arduino → Piezo
+```
+Arduino Pin    Piezo    Popis
+-----------    -----    -----
+Pin 7          +        Pozitivní vývod
+GND            -        Negativní vývod
+```
+
+---
+
+## Seznam součástek (pro stabilizaci)
+- MCP6001 (single) **nebo** MCP6002 (dual, využit 1 kanál)
+- 100 nF keramika (x2):
+  - 1x u opampu VDD-GND
+  - 1x u A0-GND
+- 10 µF (volitelně) u opamp napájení
+- 100 Ω (volitelně doporučeno) na výstupu opampu
+- 220 Ω sériově do A0
+- 1 µF (volitelně) paralelně na A0-GND
+- TVS/ESD dioda na signál proti GND (volitelně)
+
+---
+
+## Bezpečnostní poznámka
+Vedení 230 V AC a 5 V signálů v jednom kabelu zvyšuje riziko rušení i bezpečnostních problémů. Návrh výše je kompromis pro stávající kabeláž; montáž a izolaci je nutné provést pečlivě podle platných norem a s vědomím rizik.
