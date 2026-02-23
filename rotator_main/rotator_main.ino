@@ -8,6 +8,8 @@
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
 #include <SoftwareSerial.h>
+#include <avr/wdt.h>
+#include <avr/io.h>
 #include "version.h"
 
 // Definice pinů
@@ -35,7 +37,9 @@ constexpr int POT_MAX_TURNS = 10;
 constexpr int POT_DEGREES_PER_TURN = 360;
 
 // Konstanty pro převod
-constexpr float GEAR_RATIO = 6.0f;
+// Korekce dle měření: 360° otočení antény odpovídá změně ADC 929 -> 297.
+// GEAR_RATIO = ((929-297)/1023 * 10 otáček) / 1 otáčka antény = 6.1779
+constexpr float GEAR_RATIO = 6.1779081f;
 
 // Limity v procentech s hysterezí
 constexpr float LOW_LIMIT_ON_PERCENT = 9.0f;
@@ -112,6 +116,12 @@ void renderBootFrame(unsigned long nowMs);
 #endif
 
 void setup() {
+  // Guard against watchdog reset loops after brownouts
+  wdt_disable();
+
+  uint8_t mcusrFlags = MCUSR;
+  MCUSR = 0;
+
   Serial.begin(9600);
   pinMode(RX_PIN, INPUT_PULLUP);  // Open-collector DATA musí mít klidovou úroveň HIGH.
   linkSerial.begin(LINK_BAUD);
@@ -122,6 +132,18 @@ void setup() {
   applyRelayInterlock(true, true);
 
   DBG_PRINTLN("Rotator UNO v2 - init");
+  if (mcusrFlags & _BV(WDRF)) {
+    DBG_PRINTLN("Reset reason: WDT");
+  }
+  if (mcusrFlags & _BV(BORF)) {
+    DBG_PRINTLN("Reset reason: Brown-out");
+  }
+  if (mcusrFlags & _BV(EXTRF)) {
+    DBG_PRINTLN("Reset reason: External");
+  }
+  if (mcusrFlags & _BV(PORF)) {
+    DBG_PRINTLN("Reset reason: Power-on");
+  }
 
   tft.init(240, 320);
   tft.setRotation(3);
@@ -140,9 +162,13 @@ void setup() {
   updateDisplay();
 
   DBG_PRINTLN("UNO waiting for data...");
+
+  // Enable watchdog to recover from hangs due to brownouts/spikes
+  wdt_enable(WDTO_2S);
 }
 
 void loop() {
+  wdt_reset();
   processIncomingPackets();
 
   unsigned long now = millis();
